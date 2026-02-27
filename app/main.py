@@ -1,210 +1,127 @@
-from __future__ import annotations
-
-import json
 import os
-from typing import Optional
-
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import uuid
+import fitz  # PyMuPDF para extraer texto
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import FileResponse, HTMLResponse
+from pydantic import BaseModel
+import google.generativeai as genai
+from ebooklib import epub
 
-from app.utils import ensure_dirs, safe_join, sanitize_filename, now_utc_iso
-from app.processor import (
-    extract_text_from_pdf,
-    ai_organize_ebook,
-    render_preview_html,
-    generate_epub_from_structure,
+app = FastAPI(title="Wae Production Premium API")
+
+# 1. Habilitar CORS (Crucial para que el Dashboard vea la previsualización)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-try:
-    from dotenv import load_dotenv  # type: ignore
+# 2. Configuración de IA (Gemini 2.5 Flash)
+# RECUERDA: Configura GEMINI_API_KEY en las variables de entorno de Railway
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
+model = genai.GenerativeModel('gemini-2.5-flash-preview-09-2025')
 
-    load_dotenv()
-except Exception:
-    # dotenv es opcional; en Railway/Railwail suele usarse panel de variables
-    pass
-
-APP_NAME = "EbookWaeLab Premium SaaS API"
-
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "outputs")
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
-
-ALLOWED_STYLES = {"minimalista", "académico", "narrativo", "técnico"}
-
-
-class UploadPayload(BaseModel):
-    style: str = Field(..., description="minimalista | académico | narrativo | técnico")
-    title: Optional[str] = None
-    author: Optional[str] = None
-    language: str = "es"
-
+# Directorios de trabajo
+UPLOAD_DIR = "uploads"
+OUTPUT_DIR = "outputs"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 class PreviewRequest(BaseModel):
-    text: str = Field(..., min_length=1)
     style: str
-    title: Optional[str] = None
-    author: Optional[str] = None
-    language: str = "es"
+    text: str
 
+class EpubRequest(BaseModel):
+    title: str
+    author: str
+    text: str
+    style: str
 
-class GenerateEpubRequest(PreviewRequest):
-    isbn: Optional[str] = None
-    publish_date: Optional[str] = None
-    file_name: Optional[str] = None
+@app.get("/")
+async def health():
+    return {"status": "online", "engine": "Gemini 2.5 Flash", "cors": "enabled"}
 
-
-def create_app() -> FastAPI:
-    ensure_dirs(UPLOAD_DIR, OUTPUT_DIR)
-
-    app = FastAPI(title=APP_NAME, version="2.0.0")
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    @app.get("/health")
-    def health():
-        return {"status": "ok", "service": APP_NAME, "time": now_utc_iso()}
-
-    # 1) Subida PDF (multipart) + payload JSON
-    # Requerimiento del usuario: "Recibe JSON: {style, pdf_file}".
-    # En HTTP real, archivo + JSON se envía típicamente como multipart/form-data:
-    # - payload: string JSON
-    # - pdf_file: archivo PDF
-    @app.post("/upload_pdf/")
-    async def upload_pdf(
-        payload: str = Form(..., description="JSON string con {style,title,author,language}"),
-        pdf_file: UploadFile = File(...),
-    ):
-        try:
-            payload_dict = json.loads(payload)
-            p = UploadPayload(**payload_dict)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"payload JSON inválido: {e}")
-
-        if p.style not in ALLOWED_STYLES:
-            raise HTTPException(status_code=400, detail=f"style inválido. Usa: {sorted(ALLOWED_STYLES)}")
-
-        if not (pdf_file.filename or "").lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Solo se acepta PDF.")
-
-        safe_name = sanitize_filename(pdf_file.filename or "upload.pdf")
-        pdf_path = safe_join(UPLOAD_DIR, safe_name)
-
-        content = await pdf_file.read()
-        if not content:
-            raise HTTPException(status_code=400, detail="Archivo vacío.")
-
-        with open(pdf_path, "wb") as f:
-            f.write(content)
-
-        extracted = extract_text_from_pdf(pdf_path)
-        clean_text = extracted["text"]
-
-        structure = ai_organize_ebook(
-            raw_text=clean_text,
-            style=p.style,
-            openai_model=OPENAI_MODEL,
-            gemini_model=GEMINI_MODEL,
-            title_hint=p.title,
-            author_hint=p.author,
-            language=p.language,
-        )
-
-        preview_html = render_preview_html(structure=structure, style=p.style)
-
-        return JSONResponse(
-            {
-                "file_name": safe_name,
-                "detected": {
-                    "ocr_used": extracted.get("ocr_used", False),
-                    "pages": extracted.get("pages"),
-                },
-                "clean_text": clean_text,
-                "ebook": structure,
-                "preview_html": preview_html,
-            }
-        )
-
-    # 2) Preview dinámico (HTML)
-    @app.post("/preview/", response_class=HTMLResponse)
-    async def preview(req: PreviewRequest):
-        if req.style not in ALLOWED_STYLES:
-            raise HTTPException(status_code=400, detail=f"style inválido. Usa: {sorted(ALLOWED_STYLES)}")
-
-        structure = ai_organize_ebook(
-            raw_text=req.text,
-            style=req.style,
-            openai_model=OPENAI_MODEL,
-            gemini_model=GEMINI_MODEL,
-            title_hint=req.title,
-            author_hint=req.author,
-            language=req.language,
-        )
-        html = render_preview_html(structure=structure, style=req.style)
-        return HTMLResponse(content=html)
-
-    # 3) Generación de EPUB (KDP)
-    @app.post("/generate_epub/")
-    async def generate_epub(req: GenerateEpubRequest):
-        if req.style not in ALLOWED_STYLES:
-            raise HTTPException(status_code=400, detail=f"style inválido. Usa: {sorted(ALLOWED_STYLES)}")
-
-        structure = ai_organize_ebook(
-            raw_text=req.text,
-            style=req.style,
-            openai_model=OPENAI_MODEL,
-            gemini_model=GEMINI_MODEL,
-            title_hint=req.title,
-            author_hint=req.author,
-            language=req.language,
-        )
-
-        final_name = req.file_name or f"{(structure.get('title') or 'ebook').strip().replace(' ', '_')}.epub"
-        final_name = sanitize_filename(final_name)
-        if not final_name.lower().endswith(".epub"):
-            final_name += ".epub"
-
-        epub_path = safe_join(OUTPUT_DIR, final_name)
-
-        generate_epub_from_structure(
-            structure=structure,
-            style=req.style,
-            output_path=epub_path,
-            isbn=req.isbn,
-            publish_date=req.publish_date,
-        )
+# ENDPOINT 1: Subir y extraer texto
+@app.post("/upload_pdf/")
+async def upload_pdf(file: UploadFile = File(...)):
+    try:
+        file_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}_{file.filename}")
+        with open(file_path, "wb") as buffer:
+            buffer.write(await file.read())
+        
+        # Extraer texto usando PyMuPDF
+        doc = fitz.open(file_path)
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        doc.close()
+        os.remove(file_path) # Limpiar archivo temporal
 
         return {
-            "file_name": final_name,
-            "download_url": f"/download/{final_name}",
-            "title": structure.get("title"),
-            "author": structure.get("author"),
+            "filename": file.filename,
+            "text": text,
+            "status": "success"
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # 4) Descarga EPUB
-    @app.get("/download/{file_name}")
-    async def download(file_name: str):
-        safe_name = sanitize_filename(file_name)
-        epub_path = safe_join(OUTPUT_DIR, safe_name)
-        if not os.path.exists(epub_path):
-            raise HTTPException(status_code=404, detail="EPUB no encontrado.")
+# ENDPOINT 2: Generar Preview con IA
+@app.post("/preview/")
+async def generate_preview(req: PreviewRequest):
+    try:
+        prompt = f"""
+        Actúa como un maquetador editorial experto. Toma el siguiente texto y organízalo 
+        en capítulos y párrafos con un estilo '{req.style}'. 
+        Usa etiquetas HTML (h1, h2, p). No incluyas etiquetas <html> o <body>.
+        Texto: {req.text[:4000]}
+        """
+        response = model.generate_content(prompt)
+        
+        # CSS inyectado para el Dashboard
+        styles = {
+            "académico": "font-family: serif; line-height: 1.8; text-align: justify; color: #1e293b;",
+            "técnico": "font-family: monospace; background: #f8f9fa; padding: 20px; color: #334155;",
+            "minimalista": "font-family: sans-serif; color: #444;",
+            "narrativo": "font-family: Georgia, serif; line-height: 1.6; color: #000;"
+        }
+        css = styles.get(req.style, "font-family: sans-serif;")
+        
+        return HTMLResponse(content=f"<div style='{css}'>{response.text}</div>")
+    except Exception as e:
+        return HTMLResponse(content=f"Error en IA: {str(e)}", status_code=500)
 
-        return FileResponse(
-            path=epub_path,
-            media_type="application/epub+zip",
-            filename=safe_name,
-        )
+# ENDPOINT 3: Generar EPUB Final
+@app.post("/generate_epub/")
+async def generate_epub(req: EpubRequest):
+    try:
+        book = epub.EpubBook()
+        book.set_title(req.title)
+        book.set_language('es')
+        book.add_author(req.author)
 
-    return app
+        # Dividir por capítulos simples
+        chapters_text = req.text.split('\n\n')
+        for i, content in enumerate(chapters_text[:10]): # Limitamos a 10 para ejemplo
+            c = epub.EpubHtml(title=f'Capítulo {i+1}', file_name=f'chap_{i+1}.xhtml')
+            c.content = f'<h1>Capítulo {i+1}</h1><p>{content}</p>'
+            book.add_item(c)
+            book.spine.append(c)
 
+        file_name = f"{uuid.uuid4().hex}.epub"
+        file_path = os.path.join(OUTPUT_DIR, file_name)
+        epub.write_epub(file_path, book)
 
-app = create_app()
+        return {"file_name": file_name, "download_url": f"/download/{file_name}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ENDPOINT 4: Descarga
+@app.get("/download/{file_name}")
+async def download_file(file_name: str):
+    path = os.path.join(OUTPUT_DIR, file_name)
+    if os.path.exists(path):
+        return FileResponse(path, filename="tu_libro_wae.epub")
+    return {"error": "Archivo no encontrado"}
