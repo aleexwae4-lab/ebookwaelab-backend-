@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+python-multipart
+PyPDF2
+pytesseract
+Pillow
+ebooklib
+openai
+google-generativeai
+aiofiles
+jinja2
+requests
+markdown
+python-dotenv
+# OCR PDF escaneado (opcional pero recomendado)
+pdf2image

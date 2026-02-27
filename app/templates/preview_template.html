@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>{{ title }} — Preview</title>
+
+    <link rel="stylesheet" href="/static/style.css" />
+
+    <!-- Micro-controles (opcionales): el frontend Base44 puede ocultarlos o reemplazarlos -->
+    <script>
+      function setVar(name, value){
+        document.documentElement.style.setProperty(name, value);
+      }
+      function onReady(){
+        const fs = document.getElementById('fs');
+        const lh = document.getElementById('lh');
+        if(fs) fs.addEventListener('input', e => setVar('--font-size', e.target.value + 'px'));
+        if(lh) lh.addEventListener('input', e => setVar('--line-height', e.target.value));
+      }
+      document.addEventListener('DOMContentLoaded', onReady);
+    </script>
+  </head>
+
+  <body class="{{ css_class }}" data-style="{{ style }}">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo">EWL</div>
+        <div class="meta">
+          <div class="title">{{ title }}</div>
+          <div class="author">por {{ author }}</div>
+          <div class="style">estilo: <strong>{{ style }}</strong></div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <div class="control">
+          <label>Tipografía</label>
+          <input id="fs" type="range" min="14" max="22" value="17" />
+        </div>
+        <div class="control">
+          <label>Interlineado</label>
+          <input id="lh" type="range" min="1.35" max="1.9" step="0.05" value="1.6" />
+        </div>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="toc">
+        <div class="toc-title">Contenido</div>
+        <ol class="toc-list">
+          {% for item in toc %}
+            <li><a href="#{{ item.chapter_id }}">{{ item.chapter_title }}</a></li>
+          {% endfor %}
+        </ol>
+      </aside>
+
+      <section class="content">
+        {% for ch in chapters %}
+          <article class="chapter" id="{{ ch.id }}">
+            <h1 class="chapter-title">{{ ch.title }}</h1>
+
+            {% for s in ch.sections %}
+              {% if s.title %}
+                <h2 class="section-title">{{ s.title }}</h2>
+              {% endif %}
+              <div class="section-body">
+                {{ s.html | safe }}
+              </div>
+            {% endfor %}
+          </article>
+        {% endfor %}
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>Preview dinámico · Markdown render · EPUB KDP-ready</span>
+    </footer>
+  </body>
+</html>
