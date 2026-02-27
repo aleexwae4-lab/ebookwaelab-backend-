@@ -23,10 +23,10 @@ app.add_middleware(
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
 if API_KEY:
     genai.configure(api_key=API_KEY)
-    # Cambiamos a 1.5-flash para máxima compatibilidad en Railway
+    # 1.5-flash es el más compatible y rápido para Railway
     model = genai.GenerativeModel('gemini-1.5-flash')
 else:
-    print("❌ ERROR: No se encontró GEMINI_API_KEY en las variables.")
+    print("❌ ERROR: No se encontró GEMINI_API_KEY en las variables de Railway.")
 
 # Carpetas
 UPLOAD_DIR = "uploads"
@@ -46,7 +46,12 @@ class EpubRequest(BaseModel):
 
 @app.get("/")
 async def health():
-    return {"status": "online", "ia_active": bool(API_KEY), "model": "gemini-1.5-flash"}
+    return {
+        "status": "online", 
+        "ia_active": bool(API_KEY), 
+        "model": "gemini-1.5-flash",
+        "info": "Si ia_active es false, revisa tus variables en Railway"
+    }
 
 @app.post("/upload_pdf/")
 async def upload_pdf(file: UploadFile = File(...)):
@@ -59,6 +64,10 @@ async def upload_pdf(file: UploadFile = File(...)):
         text = "".join([page.get_text() for page in doc])
         doc.close()
         os.remove(file_path)
+        
+        if not text.strip():
+            raise Exception("El PDF parece estar vacío o ser solo imágenes.")
+            
         return {"filename": file.filename, "text": text, "status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error PDF: {str(e)}")
@@ -66,28 +75,39 @@ async def upload_pdf(file: UploadFile = File(...)):
 @app.post("/preview/")
 async def generate_preview(req: PreviewRequest):
     if not API_KEY:
-        raise HTTPException(status_code=500, detail="Falta GEMINI_API_KEY en Railway")
+        raise HTTPException(status_code=500, detail="Falta la clave GEMINI_API_KEY en Railway")
+    
     try:
-        # Prompt científico
-        prompt = f"Actúa como maquetador editorial. Estructura este texto con estilo '{req.style}' usando HTML (h1, p). Solo contenido: {req.text[:4000]}"
+        # CORRECCIÓN: Ahora sí incluimos el texto en el prompt
+        prompt = (
+            f"Actúa como un maquetador editorial premium. "
+            f"Estructura el siguiente texto con el estilo '{req.style}' usando etiquetas HTML (h1, p). "
+            f"Devuelve solo el HTML del contenido sin etiquetas body o html. "
+            f"Texto: {req.text[:4000]}"
+        )
+        
         response = model.generate_content(prompt)
         
-        # Estilos visuales
+        if not response.text:
+            raise Exception("La IA no devolvió contenido.")
+
+        # Estilos visuales para inyectar en el Dashboard
         styles = {
             "académico": "font-family: serif; line-height: 1.8; color: #1e293b; text-align: justify;",
-            "técnico": "font-family: monospace; background: #f8fafc; padding: 20px; border-left: 5px solid #f97316;",
-            "minimalista": "font-family: sans-serif; color: #333;",
-            "narrativo": "font-family: Georgia, serif; line-height: 1.7;"
+            "técnico": "font-family: monospace; background: #f8fafc; padding: 25px; border-left: 5px solid #f97316;",
+            "minimalista": "font-family: sans-serif; color: #334155; line-height: 1.6;",
+            "narrativo": "font-family: Georgia, serif; line-height: 1.7; color: #111;"
         }
         css = styles.get(req.style, "font-family: sans-serif;")
+        
         return HTMLResponse(content=f"<div style='{css}'>{response.text}</div>")
     except Exception as e:
-        # Si falla, devolvemos el error real para verlo en el dashboard
-        raise HTTPException(status_code=500, detail=f"Error IA: {str(e)}")
+        # Mandamos el error detallado al Dashboard
+        raise HTTPException(status_code=500, detail=f"Error Motor IA: {str(e)}")
 
 @app.get("/download/{file_name}")
 async def download(file_name: str):
     path = os.path.join(OUTPUT_DIR, file_name)
     if os.path.exists(path):
         return FileResponse(path, filename=file_name, media_type='application/epub+zip')
-    return {"error": "No encontrado"}
+    return {"error": "Archivo no encontrado"}
