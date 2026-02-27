@@ -1,86 +1,93 @@
-from __future__ import annotations
-
 import os
-import re
-import unicodedata
-from datetime import datetime, timezone
-from typing import Optional
+import uuid
+import fitz  # PyMuPDF
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse
+from pydantic import BaseModel
+import google.generativeai as genai
+from ebooklib import epub
 
+app = FastAPI(title="Wae Production API")
 
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# 1. Configuración de CORS - Vital para la previsualización
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+# 2. Configuración de Gemini (Usando el modelo ESTABLE 1.5 Flash)
+API_KEY = os.environ.get("GEMINI_API_KEY", "")
+if API_KEY:
+    genai.configure(api_key=API_KEY)
+    # Cambiamos a 1.5-flash para máxima compatibilidad en Railway
+    model = genai.GenerativeModel('gemini-1.5-flash')
+else:
+    print("❌ ERROR: No se encontró GEMINI_API_KEY en las variables.")
 
-def ensure_dirs(*paths: str) -> None:
-    for p in paths:
-        os.makedirs(p, exist_ok=True)
+# Carpetas
+UPLOAD_DIR = "uploads"
+OUTPUT_DIR = "outputs"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+class PreviewRequest(BaseModel):
+    style: str
+    text: str
 
-def sanitize_filename(name: str) -> str:
-    """Sanitiza nombres de archivo (evita rutas y caracteres raros)."""
-    name = (name or "").strip().replace("\\", "/").split("/")[-1]
-    name = re.sub(r"\s+", " ", name).strip()
+class EpubRequest(BaseModel):
+    title: str
+    author: str
+    text: str
+    style: str
 
-    normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
-    normalized = re.sub(r"[^a-zA-Z0-9._ -]+", "", normalized)
-    normalized = normalized.replace(" ", "_")
-    return normalized or "file"
+@app.get("/")
+async def health():
+    return {"status": "online", "ia_active": bool(API_KEY), "model": "gemini-1.5-flash"}
 
-
-def safe_join(base_dir: str, filename: str) -> str:
-    """Previene path traversal, fuerza a que el archivo viva dentro de base_dir."""
-    base_dir = os.path.abspath(base_dir)
-    full = os.path.abspath(os.path.join(base_dir, filename))
-    if not (full == base_dir or full.startswith(base_dir + os.sep)):
-        raise ValueError("Ruta insegura detectada")
-    return full
-
-
-def compact_whitespace(text: str) -> str:
-    text = (text or "").replace("\x00", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def style_to_css_class(style: str) -> str:
-    mapping = {
-        "minimalista": "style-minimal",
-        "académico": "style-academic",
-        "narrativo": "style-narrative",
-        "técnico": "style-technical",
-    }
-    return mapping.get(style, "style-academic")
-
-
-def guess_is_scanned(extracted_text: str, min_chars: int = 800) -> bool:
-    return len((extracted_text or "").strip()) < min_chars
-
-
-def try_ocr_pdf(pdf_path: str, lang: str = "spa+eng") -> Optional[str]:
-    """OCR opcional (no rompe si faltan dependencias del sistema).
-
-    Requiere (cuando se usa):
-    - tesseract instalado en el sistema
-    - pdf2image + poppler
-    """
+@app.post("/upload_pdf/")
+async def upload_pdf(file: UploadFile = File(...)):
     try:
-        import pytesseract  # type: ignore
-        from pdf2image import convert_from_path  # type: ignore
-    except Exception:
-        return None
+        file_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}_{file.filename}")
+        with open(file_path, "wb") as buffer:
+            buffer.write(await file.read())
+        
+        doc = fitz.open(file_path)
+        text = "".join([page.get_text() for page in doc])
+        doc.close()
+        os.remove(file_path)
+        return {"filename": file.filename, "text": text, "status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error PDF: {str(e)}")
 
+@app.post("/preview/")
+async def generate_preview(req: PreviewRequest):
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="Falta GEMINI_API_KEY en Railway")
     try:
-        images = convert_from_path(pdf_path, dpi=220)
-    except Exception:
-        return None
+        # Prompt científico
+        prompt = f"Actúa como maquetador editorial. Estructura este texto con estilo '{req.style}' usando HTML (h1, p). Solo contenido: {req.text[:4000]}"
+        response = model.generate_content(prompt)
+        
+        # Estilos visuales
+        styles = {
+            "académico": "font-family: serif; line-height: 1.8; color: #1e293b; text-align: justify;",
+            "técnico": "font-family: monospace; background: #f8fafc; padding: 20px; border-left: 5px solid #f97316;",
+            "minimalista": "font-family: sans-serif; color: #333;",
+            "narrativo": "font-family: Georgia, serif; line-height: 1.7;"
+        }
+        css = styles.get(req.style, "font-family: sans-serif;")
+        return HTMLResponse(content=f"<div style='{css}'>{response.text}</div>")
+    except Exception as e:
+        # Si falla, devolvemos el error real para verlo en el dashboard
+        raise HTTPException(status_code=500, detail=f"Error IA: {str(e)}")
 
-    out = []
-    for img in images:
-        try:
-            out.append(pytesseract.image_to_string(img, lang=lang))
-        except Exception:
-            continue
-
-    text = "\n\n".join(out).strip()
-    return text or None
+@app.get("/download/{file_name}")
+async def download(file_name: str):
+    path = os.path.join(OUTPUT_DIR, file_name)
+    if os.path.exists(path):
+        return FileResponse(path, filename=file_name, media_type='application/epub+zip')
+    return {"error": "No encontrado"}
